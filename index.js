@@ -290,7 +290,7 @@ const MENUS = {
 ├⊷ .story - Generate story
 ├⊷ .poem - Generate poem
 ├⊷ .lyrics - Generate lyrics
-��⊷ .caption - Generate caption
+├⊷ .caption - Generate caption
 ├⊷ .emailai - Email generator
 ├⊷ .teacher - AI teacher
 ├⊷ .mathai - Math solver
