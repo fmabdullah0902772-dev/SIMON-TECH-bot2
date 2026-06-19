@@ -27,11 +27,10 @@ const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const sessionsDir = path.join(__dirname, 'sessions');
 if (!fs.existsSync(sessionsDir)) fs.mkdirSync(sessionsDir, { recursive: true });
 
-const userSessions = new Map();     // chatId -> session data
-const activeSockets = new Map();    // chatId -> socket
-const activeWABots = new Map();     // chatId -> socket (connected)
-const forceQRMode = new Map();      // chatId -> boolean
-const processing = new Map();       // chatId -> boolean (to prevent multiple)
+const userSessions = new Map();
+const activeSockets = new Map();
+const activeWABots = new Map();
+const processing = new Map(); // prevent duplicate requests
 
 // ---------- HELPERS ----------
 function detectCountry(phoneNumber) {
@@ -49,7 +48,7 @@ function detectCountry(phoneNumber) {
   return '🌍 Unknown';
 }
 
-// ---------- MENUS (Short version – replace with your full menu if needed) ----------
+// ---------- MENUS (Short – replace with full if needed) ----------
 const MENUS = {
   main: `
 ╔════════════════════════════════════╗
@@ -79,19 +78,21 @@ bot.onText(/\/start/, (msg) => {
   bot.sendMessage(chatId, `
 ╔══════════════════════════════════════╗
 ║   ♡ SIMON TECH BOT2 👀              ║
-║    WhatsApp Linking                  ║
+║    WhatsApp Linking (QR Only)        ║
 ╚══════════════════════════════════════╝
 
-📱 **Linking Process**
+📱 **Linking via QR Code**
 
 1️⃣ Send your WhatsApp number (with country code)  
    Example: 923124001592 (Pakistan)  
    or +447911123456 (UK)
 
-2️⃣ Bot will try **Pairing Code** first.  
-   If not available, it will send a **QR Code** instead.
+2️⃣ I will generate a **QR code** for you.
 
-✅ Works for all countries and any number format!
+3️⃣ Open WhatsApp → Settings → Linked Devices  
+   Tap "Link a Device" and scan the QR code.
+
+✅ Works in all countries – no restrictions!
 
 📤 Send your phone number now:
 `);
@@ -104,32 +105,20 @@ bot.on('message', async (msg) => {
 
   if (text.startsWith('/')) return;
 
-  // Handle .qr command
-  if (text === '.qr') {
-    forceQRMode.set(chatId, true);
-    return bot.sendMessage(chatId, '✅ Force QR mode ON. Now send your phone number – I will generate only QR code.');
-  }
-
   // If it's a command starting with '.' and user is connected, handle later
   if (text.startsWith('.')) return;
 
   if (!text) return;
 
-  // Prevent multiple simultaneous processing for same chat
+  // Prevent multiple simultaneous processing
   if (processing.get(chatId)) {
     return bot.sendMessage(chatId, '⏳ Already processing your request. Please wait...');
   }
   processing.set(chatId, true);
 
   try {
-    await bot.sendMessage(chatId, '⏳ Connecting to WhatsApp...');
-
-    if (forceQRMode.get(chatId)) {
-      await generateQROnly(text, chatId);
-      forceQRMode.delete(chatId);
-    } else {
-      await generatePairingOrQR(text, chatId);
-    }
+    await bot.sendMessage(chatId, '⏳ Generating QR code...');
+    await generateQRCode(text, chatId);
   } catch (error) {
     console.error(error);
     bot.sendMessage(chatId, `❌ Error: ${error.message}`);
@@ -138,19 +127,19 @@ bot.on('message', async (msg) => {
   }
 });
 
-// ---------- GENERATE PAIRING + QR FALLBACK (FIXED) ----------
-async function generatePairingOrQR(phoneNumber, chatId) {
+// ---------- QR CODE GENERATION (ONLY QR, NO PAIRING) ----------
+async function generateQRCode(phoneNumber, chatId) {
   try {
     const sessionName = `SIMON_${Date.now()}`;
     const sessionPath = path.join(sessionsDir, sessionName);
     const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
 
-    // ---- Create socket with proper logger ----
+    // Create socket with proper logger
     const sock = makeWASocket({
       auth: state,
       printQRInTerminal: false,
       browser: ['SIMON TECH BOT2', 'Windows', '1.0'],
-      qrTimeout: 60000,
+      qrTimeout: 120000, // 2 minutes
       logger: {
         level: 'error',
         child: () => this,
@@ -165,19 +154,14 @@ async function generatePairingOrQR(phoneNumber, chatId) {
 
     activeSockets.set(chatId, sock);
 
-    // ---- Flag to track if pairing succeeded ----
-    let pairingSuccess = false;
+    let qrSent = false;
 
-    // ---- Attach QR listener IMMEDIATELY (before pairing) ----
+    // Listen for QR event
     sock.ev.on('connection.update', async (update) => {
       const { qr, connection, lastDisconnect } = update;
 
-      // If pairing already succeeded, ignore QR
-      if (pairingSuccess) return;
-
-      // QR received – send it
-      if (qr) {
-        console.log('QR Code generated for', phoneNumber);
+      if (qr && !qrSent) {
+        qrSent = true;
         try {
           const qrImage = await QRCode.toBuffer(qr);
           const country = detectCountry(phoneNumber);
@@ -193,10 +177,10 @@ Country: ${country}
 2. Tap "Link a Device"
 3. Scan this QR code with your phone
 
-⏳ Waiting for connection...
+⏳ Waiting for connection... (QR valid for 2 minutes)
 `
           });
-          // Remove the listener after sending QR to avoid duplicates
+          // Remove listener to avoid duplicate
           sock.ev.removeAllListeners('connection.update');
         } catch (qrErr) {
           console.error('QR generation error:', qrErr);
@@ -204,133 +188,30 @@ Country: ${country}
         }
       }
 
-      // Connection open – success
       if (connection === 'open') {
         console.log(`✅ Connected for ${phoneNumber}`);
         activeWABots.set(chatId, sock);
         userSessions.set(chatId, { phoneNumber, status: 'connected', country: detectCountry(phoneNumber) });
         await bot.sendMessage(chatId, `✅ Connected! Type .menu to use the bot.`);
-        pairingSuccess = true; // so that QR won't be sent later
         sock.ev.removeAllListeners('connection.update');
       }
 
-      // Disconnect handling
       if (lastDisconnect && lastDisconnect.error?.output?.statusCode === DisconnectReason.loggedOut) {
         await bot.sendMessage(chatId, '⚠️ Session logged out. Re-link using /start.');
       }
     });
 
-    // ---- Now try pairing code ----
-    try {
-      const cleanNumber = phoneNumber.replace(/^\+/, '');
-      const code = await sock.requestPairingCode(cleanNumber);
-      if (code) {
-        pairingSuccess = true; // Mark so QR listener won't send QR if it arrives later
-        const country = detectCountry(phoneNumber);
-        await bot.sendMessage(chatId, `
-╰┈➤ Pairing Code Generated 👀
+    sock.ev.on('creds.update', saveCreds);
 
-Number : ${phoneNumber}
-Country: ${country}
-Code   : ${code}
-
-⏳ Waiting for WhatsApp confirmation...
-
-📱 Steps:
-1. WhatsApp → Settings → Linked Devices
-2. Tap "Link a Device"
-3. Enter code: ${code}
-4. Confirm on phone
-
-⚠️ Code expires in 60 seconds.
-        `);
-        // No need to listen for QR now – we already have the listener, but we set flag
-        sock.ev.on('creds.update', saveCreds);
-        return; // Pairing succeeded
-      } else {
-        throw new Error('No pairing code received');
+    // If QR doesn't come within 30 seconds, send a reminder
+    setTimeout(() => {
+      if (!qrSent && !userSessions.get(chatId)?.status === 'connected') {
+        bot.sendMessage(chatId, '⏳ Still waiting for QR to generate... If it takes too long, try sending your number again.');
       }
-    } catch (pairError) {
-      // Pairing failed – but QR listener is already active, it will handle QR
-      console.log('Pairing failed, waiting for QR:', pairError.message);
-      await bot.sendMessage(chatId, `
-⚠️ Pairing code not available for your region.  
-🔄 Generating QR code... (works everywhere)
-      `);
-      // The QR will be sent by the listener when it comes
-      sock.ev.on('creds.update', saveCreds);
-    }
+    }, 30000);
 
   } catch (error) {
     console.error('Session error:', error);
-    await bot.sendMessage(chatId, `❌ Error: ${error.message}`);
-  }
-}
-
-// ---------- QR ONLY FUNCTION (with same listener fix) ----------
-async function generateQROnly(phoneNumber, chatId) {
-  try {
-    const sessionName = `SIMON_${Date.now()}`;
-    const sessionPath = path.join(sessionsDir, sessionName);
-    const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
-
-    const sock = makeWASocket({
-      auth: state,
-      printQRInTerminal: false,
-      browser: ['SIMON TECH BOT2', 'Windows', '1.0'],
-      qrTimeout: 60000,
-      logger: {
-        level: 'error',
-        child: () => this,
-        log: () => {},
-        info: () => {},
-        warn: () => {},
-        error: () => {},
-        debug: () => {},
-        trace: () => {}
-      }
-    });
-
-    activeSockets.set(chatId, sock);
-    let qrSent = false;
-
-    sock.ev.on('connection.update', async (update) => {
-      const { qr, connection } = update;
-
-      if (qr && !qrSent) {
-        qrSent = true;
-        try {
-          const qrImage = await QRCode.toBuffer(qr);
-          const country = detectCountry(phoneNumber);
-          await bot.sendPhoto(chatId, qrImage, {
-            caption: `
-✅ QR Code Ready!
-
-Number : ${phoneNumber}
-Country: ${country}
-
-📱 Scan with WhatsApp → Settings → Linked Devices → Link a Device
-`
-          });
-          sock.ev.removeAllListeners('connection.update');
-        } catch (qrErr) {
-          console.error('QR error:', qrErr);
-          await bot.sendMessage(chatId, `❌ QR error: ${qrErr.message}`);
-        }
-      }
-
-      if (connection === 'open') {
-        console.log(`✅ Connected via QR: ${phoneNumber}`);
-        activeWABots.set(chatId, sock);
-        userSessions.set(chatId, { phoneNumber, status: 'connected', country: detectCountry(phoneNumber) });
-        await bot.sendMessage(chatId, `✅ Connected! Type .menu to use bot.`);
-        sock.ev.removeAllListeners('connection.update');
-      }
-    });
-    sock.ev.on('creds.update', saveCreds);
-
-  } catch (error) {
-    console.error('QR session error:', error);
     await bot.sendMessage(chatId, `❌ Error: ${error.message}`);
   }
 }
@@ -391,11 +272,10 @@ Type .menu for commands.
 // ---------- OTHER COMMANDS ----------
 bot.onText(/\/help/, (msg) => {
   bot.sendMessage(msg.chat.id, `
-/start – Begin linking (pairing first, QR fallback)
+/start – Begin linking (QR only)
 /help – Show this
 /status – Check session
 /reset – Reset and start over
-.qr – Force QR only (no pairing attempt)
 `);
 });
 
@@ -424,7 +304,6 @@ bot.onText(/\/reset/, (msg) => {
     activeWABots.delete(chatId);
   }
   userSessions.delete(chatId);
-  forceQRMode.delete(chatId);
   processing.delete(chatId);
   bot.sendMessage(chatId, '✅ Session reset. Use /start to link again.');
 });
@@ -439,4 +318,4 @@ process.on('SIGINT', () => {
   server.close(() => process.exit(0));
 });
 
-console.log('✅ SIMON TECH BOT2 started (QR fixed, no duplicates)');
+console.log('✅ SIMON TECH BOT2 started – QR only mode, works globally!');
