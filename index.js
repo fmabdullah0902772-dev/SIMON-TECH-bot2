@@ -4,6 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const express = require('express');
 const http = require('http');
+const QRCode = require('qrcode'); // 🔹 New package
 
 // Express HTTP Server for Railway Healthcheck
 const app = express();
@@ -99,7 +100,7 @@ function validatePhoneNumber(phoneNumber) {
   return phoneRegex.test(phoneNumber);
 }
 
-// Command Menus
+// Command Menus (unchanged, keep as is)
 const MENUS = {
   main: `
 ╔════════════════════════════════════╗
@@ -561,18 +562,19 @@ bot.onText(/\/start/, (msg) => {
 ║    WhatsApp Linking Process          ║
 ╚══════════════════════════════════════╝
 
-📱 WhatsApp Linking Process
+📱 WhatsApp Linking Options:
 
-1️⃣ Send your WhatsApp phone number (with country code)
+1️⃣ **Pairing Code** (default)  
+   Send your phone number with country code.  
    Example: +1234567890
 
-2️⃣ You'll receive a REAL 8-digit linking code from WhatsApp
+2️⃣ **QR Code** (works for all countries)  
+   Use the command: .qr  
+   Then scan the QR image with your WhatsApp.
 
-3️⃣ Enter that code in WhatsApp → Linked Devices
+🔹 If pairing code fails due to country, QR will be used automatically.
 
-4️⃣ Done! Your WhatsApp is now linked.
-
-📤 Reply with your phone number to continue:
+📤 Reply with your phone number to continue (or type .qr):
 `;
 
   bot.sendMessage(chatId, startMessage);
@@ -584,7 +586,7 @@ bot.on('message', async (msg) => {
   const text = msg.text.trim();
 
   // Skip if message is a command
-  if (text.startsWith('/')) return;
+  if (text.startsWith('/') || text.startsWith('.')) return;
 
   // Validate phone number format
   if (!validatePhoneNumber(text)) {
@@ -609,7 +611,7 @@ Example formats:
     await bot.sendMessage(chatId, '⏳ Requesting pairing code from WhatsApp...');
 
     // Generate real WhatsApp pairing code
-    await generateWhatsAppPairingCode(text, chatId);
+    await generateWhatsAppPairingCode(text, chatId, false); // false = try pairing first
 
   } catch (error) {
     console.error('Error:', error);
@@ -618,14 +620,44 @@ Example formats:
 
 Error: ${error.message}
 
-Please try again with a valid phone number.
+Please try using QR code: type .qr and scan the QR image.
 `;
     await bot.sendMessage(chatId, errorMsg);
   }
 });
 
-// Generate REAL WhatsApp Pairing Code
-async function generateWhatsAppPairingCode(phoneNumber, chatId) {
+// New .qr command to force QR linking
+bot.onText(/^\.qr$/, async (msg) => {
+  const chatId = msg.chat.id;
+
+  const qrInstructions = `
+📱 QR Code Linking
+
+Please send your phone number (with country code) to generate a QR code.
+
+Example: +1234567890
+
+After you send the number, I'll generate a QR code.
+Open WhatsApp → Settings → Linked Devices → Link a Device → Scan the QR code.
+
+⏳ Send your phone number now:
+`;
+  await bot.sendMessage(chatId, qrInstructions);
+
+  // Wait for the user to reply with a phone number
+  // We'll use a one-time listener
+  bot.once('message', async (msg) => {
+    const number = msg.text.trim();
+    if (!validatePhoneNumber(number)) {
+      return bot.sendMessage(chatId, '❌ Invalid phone number. Please send a valid number with country code.');
+    }
+    // Start QR linking (force QR)
+    await generateWhatsAppPairingCode(number, chatId, true);
+  });
+});
+
+// Generate REAL WhatsApp Pairing Code (or QR)
+async function generateWhatsAppPairingCode(phoneNumber, chatId, forceQR = false) {
   try {
     const sessionName = `SIMON_${Date.now()}`;
     const sessionPath = path.join(sessionsDir, sessionName);
@@ -651,7 +683,63 @@ async function generateWhatsAppPairingCode(phoneNumber, chatId) {
       setTimeout(resolve, 2000);
     });
 
-    // Request REAL pairing code from WhatsApp
+    // If forced QR, skip pairing code and just listen for QR
+    if (forceQR) {
+      await bot.sendMessage(chatId, '⏳ Generating QR code...');
+      // Listen for QR event
+      sock.ev.on('connection.update', async (update) => {
+        const { qr, connection } = update;
+
+        if (qr) {
+          console.log('QR Code generated for', phoneNumber);
+          try {
+            // Generate QR image
+            const qrImage = await QRCode.toBuffer(qr);
+            await bot.sendPhoto(chatId, qrImage, {
+              caption: `
+✅ QR Code generated!
+
+📱 Instructions:
+1. Open WhatsApp on your phone
+2. Go to Settings → Linked Devices
+3. Tap "Link a Device"
+4. Scan this QR code with your phone
+
+⏳ Waiting for connection...
+`
+            });
+          } catch (qrError) {
+            console.error('QR image error:', qrError);
+            await bot.sendMessage(chatId, `❌ Could not generate QR image: ${qrError.message}`);
+          }
+        }
+
+        if (connection === 'open') {
+          console.log(`✅ WhatsApp connected for ${phoneNumber}`);
+          activeWABots.set(chatId, sock);
+          const session = userSessions.get(chatId);
+          if (session) session.status = 'connected';
+
+          await bot.sendMessage(chatId, `
+✅ ᴄᴏɴɴᴇᴄᴛɪᴏɴ sᴜᴄᴄᴇssғᴜʟ!
+
+[ ♡ SIMON TECH BOT2 👀 ]
+
+╰┈➤ ɴᴜᴍʙᴇʀ : ${phoneNumber}
+╰┈➤ sᴛᴀᴛᴜs : ✅ Connected
+
+✅ Your WhatsApp account is now linked!
+
+Type .menu to see all available commands!
+`);
+        }
+      });
+
+      sock.ev.on('creds.update', saveCreds);
+      return;
+    }
+
+    // ---- Try Pairing Code first ----
     try {
       const code = await sock.requestPairingCode(phoneNumber);
 
@@ -675,9 +763,7 @@ async function generateWhatsAppPairingCode(phoneNumber, chatId) {
 [ ♡ SIMON TECH BOT2 👀 ]
 
 ╰┈➤ ɴᴜᴍʙᴇʀ : ${phoneNumber}
-
 ╰┈➤ ᴄᴏᴜɴᴛʀʏ : ${userSession.country}
-
 ╰┈➤ ᴄᴏᴅᴇ : ${code}
 
 [ Sᴇssɪᴏɴ Cᴏɴɴᴇᴄᴛɪɴɢ. ❤️‍🩹 ]
@@ -702,8 +788,6 @@ async function generateWhatsAppPairingCode(phoneNumber, chatId) {
 
           if (connection === 'open') {
             console.log(`✅ WhatsApp connected for ${phoneNumber}`);
-
-            // Store WhatsApp bot for command handling
             activeWABots.set(chatId, sock);
 
             const successMsg = `
@@ -712,30 +796,11 @@ async function generateWhatsAppPairingCode(phoneNumber, chatId) {
 [ ♡ SIMON TECH BOT2 👀 ]
 
 ╰┈➤ ɴᴜᴍʙᴇʀ : ${phoneNumber}
-
 ╰┈➤ sᴛᴀᴛᴜs : ✅ Connected
 
 ✅ Your WhatsApp account is now linked!
 
-🎉 Bot is ready to use!
-
-📝 Now you can use WhatsApp commands:
-
 Type .menu to see all available commands!
-
-Available Categories:
-👑 Owner | ⚙️ System | 👤 Profile
-👥 Group | 🔐 Security | 🧠 AI
-📥 Download | 🖼️ Media | 🎮 Games
-💰 Economy | 🏦 Bank | 🎭 Anime
-🔍 Search | 🛠️ Tools | 🌐 Internet
-🎨 Design | 📚 Education | ☁️ Cloud
-🚀 Developer
-
-📊 TOTAL: 800+ Commands
-⚡ VERSION: 2.0.0
-👑 OWNER: SIMON TECH
-🚀 STATUS: ONLINE 🟢
 `;
 
             await bot.sendMessage(chatId, successMsg);
@@ -748,52 +813,79 @@ Available Categories:
         });
 
         sock.ev.on('creds.update', saveCreds);
-
+        return; // Success, exit function
       } else {
-        await bot.sendMessage(chatId, '❌ Failed to generate pairing code. Please try again.');
+        throw new Error('No pairing code received');
       }
 
     } catch (pairingError) {
-      console.error('Pairing error:', pairingError);
+      console.error('Pairing error (will fallback to QR):', pairingError);
       
-      // Try QR code as fallback
+      // If pairing fails, fallback to QR
+      await bot.sendMessage(chatId, `
+⚠️ Pairing code generation failed for your country.  
+🔄 Switching to QR code method...
+
+Please wait while I generate a QR code for you.
+`);
+
+      // Listen for QR event
       sock.ev.on('connection.update', async (update) => {
         const { qr, connection } = update;
 
         if (qr) {
-          console.log('Fallback: QR Code generated');
-          await bot.sendMessage(
-            chatId,
-            '❌ Could not generate phone pairing code.\n\n⚠️ Alternative: Please use the web session generator.\n\nThen scan the QR code with WhatsApp camera'
-          );
+          console.log('Fallback QR Code generated for', phoneNumber);
+          try {
+            const qrImage = await QRCode.toBuffer(qr);
+            await bot.sendPhoto(chatId, qrImage, {
+              caption: `
+✅ QR Code generated!
+
+📱 Instructions:
+1. Open WhatsApp on your phone
+2. Go to Settings → Linked Devices
+3. Tap "Link a Device"
+4. Scan this QR code with your phone
+
+⏳ Waiting for connection...
+`
+            });
+          } catch (qrError) {
+            console.error('QR image error:', qrError);
+            await bot.sendMessage(chatId, `❌ Could not generate QR image: ${qrError.message}`);
+          }
         }
 
         if (connection === 'open') {
-          const session = userSessions.get(chatId);
-          if (session) {
-            session.status = 'connected';
-          }
-
+          console.log(`✅ WhatsApp connected for ${phoneNumber} (via QR)`);
           activeWABots.set(chatId, sock);
+          const session = userSessions.get(chatId);
+          if (session) session.status = 'connected';
 
-          await bot.sendMessage(chatId, '✅ WhatsApp connected via QR code!\n\nType .menu to see all commands!');
+          await bot.sendMessage(chatId, `
+✅ ᴄᴏɴɴᴇᴄᴛɪᴏɴ sᴜᴄᴄᴇssғᴜʟ!
 
-          setTimeout(() => {
-            sock.end(new Error('Closed'));
-            activeSockets.delete(chatId);
-          }, 5000);
+[ ♡ SIMON TECH BOT2 👀 ]
+
+╰┈➤ ɴᴜᴍʙᴇʀ : ${phoneNumber}
+╰┈➤ sᴛᴀᴛᴜs : ✅ Connected
+
+✅ Your WhatsApp account is now linked!
+
+Type .menu to see all available commands!
+`);
         }
       });
-    }
 
-    sock.ev.on('creds.update', saveCreds);
+      sock.ev.on('creds.update', saveCreds);
+    }
 
   } catch (error) {
     console.error('WhatsApp session error:', error);
     
     await bot.sendMessage(
       chatId,
-      `❌ Error: ${error.message}\n\nPlease ensure:\n• Your phone number is correct\n• WhatsApp is installed and updated\n• Your phone is connected to the internet`
+      `❌ Error: ${error.message}\n\nPlease ensure:\n• Your phone number is correct\n• WhatsApp is installed and updated\n• Your phone is connected to the internet\n\nYou can also try the .qr command to use QR code.`
     );
   }
 }
@@ -886,7 +978,7 @@ Type .menu for all commands!
     }
 
     // Handle unknown commands
-    if (text.startsWith('.') && !['menu', 'help', 'ping', 'alive', 'system', 'owner', 'ai', 'download', 'games', 'group', 'economy', 'media', 'security'].includes(text.slice(1).split(' ')[0])) {
+    if (text.startsWith('.') && !['menu', 'help', 'ping', 'alive', 'system', 'owner', 'ai', 'download', 'games', 'group', 'economy', 'media', 'security', 'qr'].includes(text.slice(1).split(' ')[0])) {
       await bot.sendMessage(chatId, `
 ❓ Command not found: ${text}
 
@@ -910,21 +1002,26 @@ bot.onText(/\/help/, (msg) => {
 /help - Show this help message
 /status - Check current session status
 /reset - Reset and start over
+.qr - Force QR code linking (works for all countries)
 
 ❓ How to link WhatsApp:
 
+*Method 1 – Pairing Code (default)*
 1️⃣ Send /start
 2️⃣ Reply with your phone number (+1234567890)
 3️⃣ You'll get a REAL 8-digit pairing code
 4️⃣ Enter it in WhatsApp Linked Devices
-5️⃣ Connection confirmed!
+
+*Method 2 – QR Code (recommended for blocked countries)*
+1️⃣ Type .qr
+2️⃣ Send your phone number
+3️⃣ Scan the QR image with WhatsApp
 
 ⚠️ Important:
 • Phone number must include country code
 • Pairing code expires after 60 seconds
-• Code is generated by WhatsApp servers
+• QR code is valid for a few minutes
 • Your account will be automatically linked
-• Never share your phone number
 
 🆘 Need help?
 Contact: @simontech_official
@@ -945,11 +1042,8 @@ bot.onText(/\/status/, (msg) => {
 [ ♡ SIMON TECH BOT2 👀 ]
 
 ╰┈➤ ɴᴜᴍʙᴇʀ : ${session.phoneNumber || 'N/A'}
-
 ╰┈➤ sᴛᴀᴛᴜs : ${session.status === 'connected' ? '✅ Connected' : '⏳ Connecting...'}
-
 ╰┈➤ ᴄᴏᴜɴᴛʀʏ : ${session.country || 'Unknown'}
-
 ${session.pairingCode ? `╰┈➤ ᴄᴏᴅᴇ : ${session.pairingCode}` : ''}
 `;
 
