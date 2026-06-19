@@ -70,7 +70,7 @@ const activeWABots = new Map();
 // Helper: Format country code detection
 function detectCountry(phoneNumber) {
   const countryMap = {
-    '+1': '🇺🇸 USA/Canada',
+    '+92': '🇵🇰 Pakistan',
     '+44': '🇬🇧 UK',
     '+91': '🇮🇳 India',
     '+234': '🇳🇬 Nigeria',
